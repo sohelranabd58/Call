@@ -1,0 +1,11 @@
+aiogram==3.7.0
+APScheduler==3.10.4
+PyMySQL==1.1.1
+pydub==0.25.1
+phonenumbers==8.13.37
+python-dotenv==1.0.1
+aiofiles==23.2.1
+pytz==2024.1
+
+# System packages (install via apt, not pip):
+# sudo apt-get install -y pjsua ffmpeg
