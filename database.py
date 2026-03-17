@@ -86,7 +86,7 @@ def save_scheduled_call(telegram_id, phone_number, audio_path, scheduled_at):
             "telegram_id": telegram_id,
             "phone_number": phone_number,
             "audio_path": audio_path,
-            "scheduled_at": str(scheduled_at),
+            "scheduled_at": scheduled_at.strftime("%Y-%m-%d %H:%M:%S") if hasattr(scheduled_at, "strftime") else str(scheduled_at)[:19].replace("T", " "),
             "status": "pending",
             "created_at": datetime.now().isoformat(),
         })
@@ -109,7 +109,7 @@ def get_pending_calls():
     with _lock:
         calls = _read_json(CALLS_FILE, {"next_id": 1, "records": []})
         sip = _read_json(SIP_FILE, {})
-        now = datetime.now().isoformat()
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         result = []
         for c in calls["records"]:
             if c["status"] == "pending" and c["scheduled_at"] <= now:

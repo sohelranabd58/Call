@@ -143,6 +143,43 @@ def test_sip_connection(domain: str, username: str, password: str):
     )
 
 
+# ── Audio conversion ───────────────────────────────────────────────────────────
+
+def _convert_to_wav(audio_path: str) -> str | None:
+    """
+    Convert any audio file to a pjsua-compatible WAV (PCM, 16-bit, 8000 Hz, mono).
+    Returns the path to the WAV file, or None on failure.
+    The caller is responsible for deleting the returned temp file if it differs
+    from the original.
+    """
+    if audio_path.lower().endswith(".wav"):
+        return audio_path
+
+    wav_path = os.path.splitext(audio_path)[0] + "_pjsua.wav"
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", audio_path,
+        "-ar", "8000",
+        "-ac", "1",
+        "-acodec", "pcm_s16le",
+        wav_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0 and os.path.isfile(wav_path):
+            logger.info("Converted %s → %s", audio_path, wav_path)
+            return wav_path
+        else:
+            logger.error("ffmpeg conversion failed: %s", result.stderr[:500])
+            return None
+    except FileNotFoundError:
+        logger.error("ffmpeg not found. Cannot convert audio.")
+        return None
+    except Exception as e:
+        logger.exception("Audio conversion error: %s", e)
+        return None
+
+
 # ── Call placement ─────────────────────────────────────────────────────────────
 
 def place_sip_call(sip_domain, sip_username, sip_password, phone_number, audio_path):
@@ -154,6 +191,11 @@ def place_sip_call(sip_domain, sip_username, sip_password, phone_number, audio_p
         logger.error("Audio file not found: %s", audio_path)
         return "failed"
 
+    wav_path = _convert_to_wav(audio_path)
+    if wav_path is None:
+        logger.error("Could not convert audio to WAV: %s", audio_path)
+        return "failed"
+
     sip_uri = f"sip:{phone_number}@{sip_domain}"
 
     cmd = [
@@ -163,7 +205,7 @@ def place_sip_call(sip_domain, sip_username, sip_password, phone_number, audio_p
         f"--username={sip_username}",
         f"--password={sip_password}",
         "--no-vad",
-        f"--play-file={audio_path}",
+        f"--play-file={wav_path}",
         "--auto-play",
         "--duration=120",
         sip_uri,
@@ -201,3 +243,9 @@ def place_sip_call(sip_domain, sip_username, sip_password, phone_number, audio_p
     except Exception as exc:
         logger.exception("Unexpected error placing call: %s", exc)
         return "failed"
+    finally:
+        if wav_path != audio_path and os.path.isfile(wav_path):
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
