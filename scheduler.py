@@ -9,8 +9,6 @@ import database
 import sip_call
 from config import (
     AUDIO_DIR,
-    MAX_CALL_RETRIES,
-    RETRY_DELAY_SECONDS,
     SCHEDULER_INTERVAL_SECONDS,
 )
 
@@ -44,8 +42,7 @@ def start_scheduler(bot):
     )
 
     scheduler.start()
-    logger.info("Scheduler started (interval=%ds, max_retries=%d).",
-                SCHEDULER_INTERVAL_SECONDS, MAX_CALL_RETRIES)
+    logger.info("Scheduler started (interval=%ds).", SCHEDULER_INTERVAL_SECONDS)
 
 
 def stop_scheduler():
@@ -87,7 +84,6 @@ async def _handle_call(call):
     telegram_id = call["telegram_id"]
     phone = call["phone_number"]
     audio_path = call["audio_path"]
-    retry_count = call.get("retry_count", 0)
 
     try:
         database.update_call_status(call_id, "in_progress")
@@ -95,8 +91,7 @@ async def _handle_call(call):
         logger.error("Could not mark call %s in_progress: %s", call_id, e)
         return
 
-    attempt_label = f"attempt {retry_count + 1}" if retry_count > 0 else "first attempt"
-    logger.info("Processing call id=%s to %s (%s)", call_id, phone, attempt_label)
+    logger.info("Processing call id=%s to %s", call_id, phone)
 
     country_code_prefix = call.get("country_code_prefix", "+88")
 
@@ -127,27 +122,13 @@ async def _handle_call(call):
         _cleanup_audio(audio_path)
         await _notify(telegram_id, msg)
 
-    elif result in ("not_answered", "failed") and retry_count < MAX_CALL_RETRIES:
-        database.increment_retry(call_id, delay_seconds=RETRY_DELAY_SECONDS)
-        status_label = "Not Answered" if result == "not_answered" else "Failed"
-        logger.info("Call %s %s (%s). Retry scheduled in %ds. (retry %d/%d)",
-                     call_id, result, detail, RETRY_DELAY_SECONDS, retry_count + 1, MAX_CALL_RETRIES)
-        await _notify(telegram_id,
-            f"<b>Call {status_label}</b>\n\n"
-            f"Number: <b>{phone}</b>\n"
-            f"Call ID: <b>{call_id}</b>\n"
-            f"Reason: {detail}\n\n"
-            f"Retrying automatically in {RETRY_DELAY_SECONDS} seconds..."
-        )
-
     elif result == "not_answered":
         database.update_call_status(call_id, "not_answered", last_result=detail)
         msg = (
             f"<b>Call Not Answered</b>\n\n"
             f"Number: <b>{phone}</b>\n"
             f"Call ID: <b>{call_id}</b>\n"
-            f"Reason: {detail}\n"
-            f"All retry attempts exhausted."
+            f"Reason: {detail}"
         )
         _cleanup_audio(audio_path)
         await _notify(telegram_id, msg)
@@ -158,8 +139,7 @@ async def _handle_call(call):
             f"<b>Call Failed</b>\n\n"
             f"Number: <b>{phone}</b>\n"
             f"Call ID: <b>{call_id}</b>\n"
-            f"Reason: {detail}\n"
-            f"All retry attempts exhausted."
+            f"Reason: {detail}"
         )
         _cleanup_audio(audio_path)
         await _notify(telegram_id, msg)

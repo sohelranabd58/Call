@@ -223,6 +223,9 @@ def _read_output_with_timeout(proc, timeout):
     return "".join(output_lines)
 
 
+_REG_ATTEMPT_TIMEOUT = 30
+
+
 def _run_pjsua(sip_uri, sip_domain, sip_username, sip_password, wav_path, with_registration=True):
     cmd = [
         "pjsua",
@@ -247,7 +250,8 @@ def _run_pjsua(sip_uri, sip_domain, sip_username, sip_password, wav_path, with_r
 
     cmd.append(sip_uri)
 
-    logger.info("Running pjsua: %s", " ".join(cmd))
+    timeout = _REG_ATTEMPT_TIMEOUT if with_registration else CALL_TIMEOUT_SECONDS
+    logger.info("Running pjsua (timeout=%ds): %s", timeout, " ".join(cmd))
 
     proc = subprocess.Popen(
         cmd,
@@ -257,7 +261,7 @@ def _run_pjsua(sip_uri, sip_domain, sip_username, sip_password, wav_path, with_r
     )
 
     try:
-        output = _read_output_with_timeout(proc, CALL_TIMEOUT_SECONDS)
+        output = _read_output_with_timeout(proc, timeout)
     except Exception as e:
         logger.error("Error reading pjsua output: %s", e)
         output = ""
@@ -340,14 +344,15 @@ def place_sip_call(sip_domain, sip_username, sip_password, phone_number, audio_p
         if result1 == "network_error":
             return "failed", "Network error - cannot reach SIP server"
 
-        if result1 == "reg_503":
-            logger.info("Registration returned 503. Retrying %s without registration (IP-auth)", phone_number)
+        if result1 in ("reg_503", "unknown"):
+            reason = "503 rejection" if result1 == "reg_503" else "no response (timeout)"
+            logger.info("Registration failed (%s). Falling back to IP-auth for %s", reason, phone_number)
             output2 = _run_pjsua(sip_uri, sip_domain, sip_username, sip_password, wav_path, with_registration=False)
             result2 = _parse_pjsua_output(output2)
             logger.info("pjsua [no-reg -> %s]: result=%s\nOutput:\n%s", phone_number, result2, output2[-2000:])
 
             if result2 == "answered":
-                return "answered", "Call answered (IP-auth mode after 503)"
+                return "answered", f"Call answered (IP-auth mode, registration had {reason})"
             if result2 == "auth_rejected":
                 return "failed", "SIP auth rejected (403) in IP-auth mode"
             if result2 == "user_not_found":
