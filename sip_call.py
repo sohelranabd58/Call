@@ -196,9 +196,18 @@ def place_sip_call(sip_domain, sip_username, sip_password, phone_number, audio_p
         logger.error("Could not convert audio to WAV: %s", audio_path)
         return "failed"
 
-    sip_uri = f"sip:{phone_number}@{sip_domain}"
+    # Strip +88 (BD country code) so the SIP provider receives local format
+    # e.g. +8801633565853 → 01633565853
+    dial_number = phone_number
+    if dial_number.startswith("+88"):
+        dial_number = dial_number[3:]
+    elif dial_number.startswith("88") and len(dial_number) > 10:
+        dial_number = dial_number[2:]
 
-    def _run_pjsua(extra_args):
+    sip_uri = f"sip:{dial_number}@{sip_domain}"
+    logger.info("SIP URI: %s (original number: %s)", sip_uri, phone_number)
+
+    def _run_pjsua(call_uri, extra_args):
         cmd = [
             "pjsua",
             "--app-log-level=4",
@@ -212,14 +221,35 @@ def place_sip_call(sip_domain, sip_username, sip_password, phone_number, audio_p
             "--auto-play",
             "--auto-play-hangup",
             "--duration=55",
-        ] + extra_args + [sip_uri]
-        return subprocess.run(
+        ] + extra_args + [call_uri]
+
+        proc = subprocess.Popen(
             cmd,
-            timeout=120,
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
+        try:
+            stdout, stderr = proc.communicate(timeout=90)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.stdin.write(b"q\n")
+                proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+
+        class _Result:
+            pass
+        r = _Result()
+        r.stdout = (stdout or b"").decode(errors="ignore")
+        r.stderr = (stderr or b"").decode(errors="ignore")
+        r.returncode = proc.returncode
+        return r
 
     def _parse_result(output, label):
         logger.info("pjsua output [%s → %s]:\n%s", label, phone_number, output)
@@ -239,7 +269,7 @@ def place_sip_call(sip_domain, sip_username, sip_password, phone_number, audio_p
 
     try:
         logger.info("Calling %s via %s@%s (with registration)", phone_number, sip_username, sip_domain)
-        r1 = _run_pjsua([
+        r1 = _run_pjsua(sip_uri, [
             f"--registrar=sip:{sip_domain}",
             "--reg-timeout=300",
         ])
@@ -254,7 +284,7 @@ def place_sip_call(sip_domain, sip_username, sip_password, phone_number, audio_p
 
         # Registration failed (503) or inconclusive → retry without registration
         logger.info("Retrying call to %s without registration (IP-auth mode)", phone_number)
-        r2 = _run_pjsua([])
+        r2 = _run_pjsua(sip_uri, [])
         output2 = r2.stdout + r2.stderr
         logger.info("pjsua output [no-reg → %s]:\n%s", phone_number, output2)
 
