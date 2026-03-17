@@ -1,7 +1,7 @@
 import os
 import sys
 
-BOT_TOKEN = os.environ.get("8621797741:AAGN_W1nu5jWFBqlncKe8jIzWaHeK38qsKo", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8621797741:AAGN_W1nu5jWFBqlncKe8jIzWaHeK38qsKo")
 if not BOT_TOKEN:
     print("ERROR: BOT_TOKEN environment variable is required. Set it and restart.")
     sys.exit(1)
