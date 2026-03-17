@@ -8,7 +8,6 @@ import pytz
 
 
 def _install_system_dependencies():
-    """Auto-install required system packages if not already installed."""
     packages = ["pjsua", "ffmpeg"]
     missing = []
     for pkg in packages:
@@ -23,10 +22,10 @@ def _install_system_dependencies():
 
     managers = [
         ["apt-get", "install", "-y", "-qq"],
-        ["apt",     "install", "-y", "-qq"],
-        ["yum",     "install", "-y"],
-        ["dnf",     "install", "-y"],
-        ["apk",     "add", "--no-cache"],
+        ["apt", "install", "-y", "-qq"],
+        ["yum", "install", "-y"],
+        ["dnf", "install", "-y"],
+        ["apk", "add", "--no-cache"],
     ]
 
     for mgr in managers:
@@ -36,14 +35,8 @@ def _install_system_dependencies():
 
         try:
             if mgr[0] in ("apt-get", "apt"):
-                subprocess.run(
-                    [mgr[0], "update", "-qq"],
-                    capture_output=True
-                )
-            result = subprocess.run(
-                mgr + missing,
-                capture_output=True
-            )
+                subprocess.run([mgr[0], "update", "-qq"], capture_output=True)
+            result = subprocess.run(mgr + missing, capture_output=True)
             if result.returncode == 0:
                 print(f"[setup] Successfully installed {missing} via {mgr[0]}")
                 return
@@ -51,7 +44,7 @@ def _install_system_dependencies():
             continue
 
     print(f"[setup] WARNING: Could not auto-install {missing}.")
-    print(f"[setup] Please install manually: pjsua ffmpeg")
+    print("[setup] Please install manually: pjsua ffmpeg")
 
 
 _install_system_dependencies()
@@ -72,8 +65,8 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 from pydub import AudioSegment
-import phonenumbers
 
+import phonenumbers
 import database
 import scheduler as sched
 import sip_call
@@ -88,10 +81,8 @@ logger = logging.getLogger(__name__)
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
 bot = Bot(token=BOT_TOKEN)
-dp  = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher(storage=MemoryStorage())
 
-
-# ─── Per-user picker lock (prevents race conditions on rapid button taps) ─────
 
 _picker_locks: dict[int, asyncio.Lock] = {}
 
@@ -102,30 +93,16 @@ def _picker_lock(user_id: int) -> asyncio.Lock:
     return _picker_locks[user_id]
 
 
-# ─── Timezone helpers (Bangladesh Standard Time = UTC+6) ─────────────────────
-
 _BD_TZ = pytz.timezone("Asia/Dhaka")
+BD_TIME_FMT = "%Y-%m-%d %H:%M:%S"
 
 
 def now_bd() -> datetime:
-    """Return current naive datetime in Bangladesh Standard Time (UTC+6)."""
     return datetime.now(_BD_TZ).replace(tzinfo=None)
 
 
-def bd_to_utc(naive_bd: datetime) -> datetime:
-    """Convert a naive Bangladesh datetime to a naive UTC datetime."""
-    return naive_bd - timedelta(hours=6)
-
-
-def utc_to_bd(naive_utc: datetime) -> datetime:
-    """Convert a naive UTC datetime to a naive Bangladesh datetime."""
-    return naive_utc + timedelta(hours=6)
-
-
-# ─── FSM ──────────────────────────────────────────────────────────────────────
-
 class AddSIP(StatesGroup):
-    domain   = State()
+    domain = State()
     username = State()
     password = State()
 
@@ -137,11 +114,9 @@ class DeleteSIP(StatesGroup):
 class ScheduleCall(StatesGroup):
     phone = State()
     audio = State()
-    date  = State()
-    time  = State()
+    date = State()
+    time = State()
 
-
-# ─── Keyboards ────────────────────────────────────────────────────────────────
 
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
@@ -161,12 +136,11 @@ MONTH_NAMES = [
 
 
 def date_picker_kb(day: int, month: int, year: int) -> InlineKeyboardMarkup:
-    """Inline spinner: ◀ Day ▶ / ◀ Month ▶ / ◀ Year ▶ + Confirm + Manual."""
     mn = MONTH_NAMES[month - 1]
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="◀️", callback_data="dp:d:-"),
-            InlineKeyboardButton(text=f"  {day:02d}  ",  callback_data="dp:noop"),
+            InlineKeyboardButton(text=f"  {day:02d}  ", callback_data="dp:noop"),
             InlineKeyboardButton(text="▶️", callback_data="dp:d:+"),
         ],
         [
@@ -185,7 +159,6 @@ def date_picker_kb(day: int, month: int, year: int) -> InlineKeyboardMarkup:
 
 
 def time_picker_kb(hour: int, minute: int) -> InlineKeyboardMarkup:
-    """Inline spinner: ◀ Hour ▶ / ◀ Minute ▶ + Confirm + Manual."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="◀️", callback_data="tp:h:-"),
@@ -205,11 +178,11 @@ def time_picker_kb(hour: int, minute: int) -> InlineKeyboardMarkup:
 def calls_keyboard(calls):
     buttons = []
     for call in calls:
-        dt = call["scheduled_at"]
-        if hasattr(dt, "strftime"):
-            dt_bd = utc_to_bd(dt)
-            label = f"📞 {call['phone_number']} — {dt_bd.strftime('%d.%m.%Y %H:%M')} BD"
-        else:
+        scheduled_str = call.get("scheduled_at", "")
+        try:
+            dt = datetime.strptime(scheduled_str, BD_TIME_FMT)
+            label = f"📞 {call['phone_number']} — {dt.strftime('%d.%m.%Y %H:%M')} BD"
+        except (ValueError, TypeError):
             label = f"📞 {call['phone_number']}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"viewcall:{call['id']}")])
     buttons.append([InlineKeyboardButton(text="❌ Close", callback_data="delcall:close")])
@@ -219,7 +192,7 @@ def calls_keyboard(calls):
 def call_detail_keyboard(call_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗑 Delete This Call", callback_data=f"delcall:{call_id}")],
-        [InlineKeyboardButton(text="⬅️ Back to List",    callback_data="delcall:back")],
+        [InlineKeyboardButton(text="⬅️ Back to List", callback_data="delcall:back")],
     ])
 
 
@@ -227,12 +200,10 @@ def confirm_delete_keyboard(call_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Yes, Delete", callback_data=f"confirmdelete:{call_id}"),
-            InlineKeyboardButton(text="❌ Cancel",      callback_data="delcall:back"),
+            InlineKeyboardButton(text="❌ Cancel", callback_data="delcall:back"),
         ],
     ])
 
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def is_valid_phone(number: str) -> bool:
     try:
@@ -244,9 +215,7 @@ def is_valid_phone(number: str) -> bool:
 
 def is_valid_sip_domain(domain: str) -> bool:
     domain = domain.strip()
-    ip_pattern = re.compile(
-        r"^(\d{1,3}\.){3}\d{1,3}$"
-    )
+    ip_pattern = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
     if ip_pattern.match(domain):
         parts = domain.split(".")
         return all(0 <= int(p) <= 255 for p in parts)
@@ -269,8 +238,6 @@ def _get_audio_duration(path: str) -> float:
         return 0.0
 
 
-# ─── /start ───────────────────────────────────────────────────────────────────
-
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -283,8 +250,6 @@ async def cmd_start(message: Message, state: FSMContext):
     )
 
 
-# ─── /cancel ──────────────────────────────────────────────────────────────────
-
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
@@ -295,13 +260,10 @@ async def cmd_cancel(message: Message, state: FSMContext):
     )
 
 
-# ─── Add SIP Account ──────────────────────────────────────────────────────────
-
 @dp.message(F.text == "📞 Add SIP Account")
 async def add_sip_start(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(AddSIP.domain)
-
     await message.answer(
         "Enter your <b>SIP Domain</b>:\n"
         "<i>Examples: sip.example.com or 192.168.1.1</i>",
@@ -333,11 +295,11 @@ async def add_sip_username(message: Message, state: FSMContext):
 
 @dp.message(AddSIP.password, ~F.text.in_(MENU_TEXTS))
 async def add_sip_password(message: Message, state: FSMContext):
-    data     = await state.get_data()
+    data = await state.get_data()
     password = message.text.strip()
-    domain   = data["domain"]
+    domain = data["domain"]
     username = data["username"]
-    loop     = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
 
     status_msg = await message.answer(
         "🔍 <b>Step 1/4:</b> Resolving domain…",
@@ -350,7 +312,6 @@ async def add_sip_password(message: Message, state: FSMContext):
         except Exception:
             pass
 
-    # ── Step 1: DNS ───────────────────────────────────────────────────────────
     ip, dns_err = await loop.run_in_executor(None, sip_call.resolve_domain, domain)
     if not ip:
         reason = "Domain name not found." if dns_err != "timeout" else "DNS lookup timed out."
@@ -362,7 +323,6 @@ async def add_sip_password(message: Message, state: FSMContext):
         )
         return
 
-    # ── Step 2: TCP :5060 ─────────────────────────────────────────────────────
     await edit(f"🔄 <b>Step 2/4:</b> Trying TCP port 5060…\n<i>({domain} → {ip})</i>")
     tcp_5060 = await loop.run_in_executor(None, sip_call.try_tcp, domain, 5060)
     if tcp_5060:
@@ -370,7 +330,6 @@ async def add_sip_password(message: Message, state: FSMContext):
         await _save_sip_and_reply(status_msg, state, message, domain, username, password, final_msg)
         return
 
-    # ── Step 3: TCP :5061 ─────────────────────────────────────────────────────
     await edit(f"🔄 <b>Step 3/4:</b> Trying TCP port 5061…\n<i>(5060 not available)</i>")
     tcp_5061 = await loop.run_in_executor(None, sip_call.try_tcp, domain, 5061)
     if tcp_5061:
@@ -378,7 +337,6 @@ async def add_sip_password(message: Message, state: FSMContext):
         await _save_sip_and_reply(status_msg, state, message, domain, username, password, final_msg)
         return
 
-    # ── Step 4: UDP :5060 then :5061 ─────────────────────────────────────────
     for port in (5060, 5061):
         await edit(
             f"🔄 <b>Step 4/4:</b> Trying UDP port {port}…\n"
@@ -391,7 +349,6 @@ async def add_sip_password(message: Message, state: FSMContext):
             await _save_sip_and_reply(status_msg, state, message, domain, username, password, udp_msg)
             return
         if ok is False:
-            # Hard rejection from server (403/404) — wrong credentials
             await edit(
                 f"❌ <b>SIP Test Failed</b>\n\n"
                 f"{udp_msg}\n\n"
@@ -400,7 +357,6 @@ async def add_sip_password(message: Message, state: FSMContext):
             )
             return
 
-    # ── All checks done — domain resolved but no SIP reply (Replit env) ───────
     final_msg = (
         f"⚠️ <b>Domain verified</b> ({domain} → {ip})\n"
         "Full SIP handshake not available in this environment, "
@@ -410,7 +366,6 @@ async def add_sip_password(message: Message, state: FSMContext):
 
 
 async def _save_sip_and_reply(status_msg, state, message, domain, username, password, result_msg):
-    """Save SIP credentials, edit the status message, then show the main menu."""
     try:
         database.save_sip_account(
             telegram_id=message.from_user.id,
@@ -419,7 +374,6 @@ async def _save_sip_and_reply(status_msg, state, message, domain, username, pass
             sip_password=password,
         )
         await state.clear()
-        # Edit the status message (no reply_markup — edit_text only accepts InlineKeyboard)
         await status_msg.edit_text(
             f"{result_msg}\n\n"
             "✅ <b>SIP account saved successfully!</b>\n\n"
@@ -427,7 +381,6 @@ async def _save_sip_and_reply(status_msg, state, message, domain, username, pass
             f"👤 Username: <code>{username}</code>",
             parse_mode="HTML",
         )
-        # Send a fresh message to show the reply keyboard
         await message.answer("What would you like to do next?", reply_markup=MAIN_MENU)
     except Exception as e:
         logger.error("save_sip_account error: %s", e)
@@ -441,8 +394,6 @@ async def _save_sip_and_reply(status_msg, state, message, domain, username, pass
         await message.answer("Use the menu below:", reply_markup=MAIN_MENU)
         await state.clear()
 
-
-# ─── Delete SIP Account ───────────────────────────────────────────────────────
 
 @dp.message(F.text == "🗑 Delete SIP Account")
 async def delete_sip_start(message: Message, state: FSMContext):
@@ -474,7 +425,7 @@ async def delete_sip_start(message: Message, state: FSMContext):
 async def confirm_delete_sip_username(message: Message, state: FSMContext):
     data = await state.get_data()
     expected = data.get("expected_username", "")
-    entered  = message.text.strip()
+    entered = message.text.strip()
 
     if entered != expected:
         cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -511,8 +462,6 @@ async def cancel_delete_sip(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("✅ Cancelled. Your SIP account is kept.")
     await callback.answer()
 
-
-# ─── Schedule Call ────────────────────────────────────────────────────────────
 
 @dp.message(F.text == "📅 Schedule Call")
 async def schedule_call_start(message: Message, state: FSMContext):
@@ -556,13 +505,13 @@ async def schedule_phone(message: Message, state: FSMContext):
 @dp.message(ScheduleCall.audio, F.content_type.in_({"audio", "voice", "document"}))
 async def schedule_audio(message: Message, state: FSMContext):
     if message.audio:
-        file_id   = message.audio.file_id
+        file_id = message.audio.file_id
         file_name = _safe_filename(message.audio.file_name or f"{file_id}.mp3")
     elif message.voice:
-        file_id   = message.voice.file_id
+        file_id = message.voice.file_id
         file_name = f"{file_id}.ogg"
     elif message.document:
-        file_id   = message.document.file_id
+        file_id = message.document.file_id
         file_name = _safe_filename(message.document.file_name or f"{file_id}.bin")
     else:
         await message.answer("❌ Please send an audio file.")
@@ -598,9 +547,22 @@ async def schedule_audio(message: Message, state: FSMContext):
         )
         return
 
-    # Default date/time = Bangladesh now + 1 hour
-    init_dt  = now_bd() + timedelta(hours=1)
-    init_min = init_dt.minute
+    await processing_msg.edit_text("⏳ <b>Converting audio to call format...</b>", parse_mode="HTML")
+    wav_path = await loop.run_in_executor(None, sip_call.convert_to_wav, audio_path)
+
+    if wav_path is None:
+        os.remove(audio_path)
+        await processing_msg.edit_text("❌ Failed to convert audio. Please send a different file.")
+        return
+
+    if wav_path != audio_path:
+        try:
+            os.remove(audio_path)
+        except Exception:
+            pass
+        audio_path = wav_path
+
+    init_dt = now_bd() + timedelta(hours=1)
 
     await state.update_data(
         audio_path=audio_path,
@@ -608,11 +570,10 @@ async def schedule_audio(message: Message, state: FSMContext):
         pick_month=init_dt.month,
         pick_year=init_dt.year,
         pick_hour=init_dt.hour,
-        pick_min=init_min,
+        pick_min=init_dt.minute,
     )
     await state.set_state(ScheduleCall.date)
 
-    mn = MONTH_NAMES[init_dt.month - 1]
     await processing_msg.edit_text(
         f"✅ <b>Audio ready!</b> Duration: {duration:.0f}s\n\n"
         f"📅 <b>Select the call date:</b>\n"
@@ -629,35 +590,32 @@ async def schedule_audio_wrong(message: Message):
 
 @dp.callback_query(ScheduleCall.date, F.data.startswith("dp:"))
 async def date_picker_cb(callback: CallbackQuery, state: FSMContext):
-    # Answer immediately — removes Telegram's loading spinner on the button
     await callback.answer()
 
-    parts  = callback.data.split(":")
+    parts = callback.data.split(":")
     action = parts[1]
 
     if action == "noop":
         return
 
-    # Acquire per-user lock — queues rapid taps so each one runs in order
     async with _picker_lock(callback.from_user.id):
-        # Re-read state AFTER acquiring the lock (previous tap may have updated it)
-        _now  = now_bd()
-        data  = await state.get_data()
-        day   = data.get("pick_day",   _now.day)
+        _now = now_bd()
+        data = await state.get_data()
+        day = data.get("pick_day", _now.day)
         month = data.get("pick_month", _now.month)
-        year  = data.get("pick_year",  _now.year)
+        year = data.get("pick_year", _now.year)
 
         if action in ("d", "m", "y"):
             delta = 1 if parts[2] == "+" else -1
             if action == "d":
                 max_d = calendar.monthrange(year, month)[1]
-                day   = (day - 1 + delta) % max_d + 1
+                day = (day - 1 + delta) % max_d + 1
             elif action == "m":
                 month = (month - 1 + delta) % 12 + 1
-                day   = min(day, calendar.monthrange(year, month)[1])
+                day = min(day, calendar.monthrange(year, month)[1])
             elif action == "y":
-                year  = max(now_bd().year, year + delta)
-                day   = min(day, calendar.monthrange(year, month)[1])
+                year = max(now_bd().year, year + delta)
+                day = min(day, calendar.monthrange(year, month)[1])
 
             await state.update_data(pick_day=day, pick_month=month, pick_year=year)
             try:
@@ -682,10 +640,10 @@ async def date_picker_cb(callback: CallbackQuery, state: FSMContext):
             return
 
         if action == "ok":
-            day      = min(day, calendar.monthrange(year, month)[1])
+            day = min(day, calendar.monthrange(year, month)[1])
             date_str = f"{year:04d}-{month:02d}-{day:02d}"
-            hour     = data.get("pick_hour", (now_bd() + timedelta(hours=1)).hour)
-            minute   = data.get("pick_min",  0)
+            hour = data.get("pick_hour", (now_bd() + timedelta(hours=1)).hour)
+            minute = data.get("pick_min", 0)
 
             await state.update_data(selected_date=date_str)
             await state.set_state(ScheduleCall.time)
@@ -701,10 +659,6 @@ async def date_picker_cb(callback: CallbackQuery, state: FSMContext):
 
 
 def _parse_date_input(text: str):
-    """
-    Try to parse user-typed date. Returns (year, month, day) or raises ValueError.
-    Accepts: DD/MM/YYYY  DD-MM-YYYY  YYYY-MM-DD
-    """
     text = text.strip()
     for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
         try:
@@ -735,7 +689,6 @@ async def schedule_date_text(message: Message, state: FSMContext):
         )
         return
 
-    # Validate not in the past
     if date(year, month, day) < now_bd().date():
         await message.answer(
             "❌ <b>That date is in the past.</b> Please enter a future date.",
@@ -744,8 +697,8 @@ async def schedule_date_text(message: Message, state: FSMContext):
         return
 
     date_str = f"{year:04d}-{month:02d}-{day:02d}"
-    hour     = data.get("pick_hour", (now_bd() + timedelta(hours=1)).hour)
-    minute   = data.get("pick_min",  0)
+    hour = data.get("pick_hour", (now_bd() + timedelta(hours=1)).hour)
+    minute = data.get("pick_min", 0)
 
     await state.update_data(selected_date=date_str, date_manual_mode=False,
                             pick_day=day, pick_month=month, pick_year=year)
@@ -763,26 +716,23 @@ async def schedule_date_text(message: Message, state: FSMContext):
 
 @dp.callback_query(ScheduleCall.time, F.data.startswith("tp:"))
 async def time_picker_cb(callback: CallbackQuery, state: FSMContext):
-    # Answer immediately — removes Telegram's loading spinner on the button
     await callback.answer()
 
-    parts  = callback.data.split(":")
+    parts = callback.data.split(":")
     action = parts[1]
 
     if action == "noop":
         return
 
-    # Acquire per-user lock — queues rapid taps so each one runs in order
     async with _picker_lock(callback.from_user.id):
-        # Re-read state AFTER acquiring the lock (previous tap may have updated it)
-        data   = await state.get_data()
-        hour   = data.get("pick_hour", 9)
-        minute = data.get("pick_min",  0)
+        data = await state.get_data()
+        hour = data.get("pick_hour", 9)
+        minute = data.get("pick_min", 0)
 
         if action in ("h", "n"):
             delta = 1 if parts[2] == "+" else -1
             if action == "h":
-                hour   = (hour + delta) % 24
+                hour = (hour + delta) % 24
             elif action == "n":
                 minute = (minute + delta) % 60
 
@@ -819,7 +769,6 @@ async def schedule_time_text(message: Message, state: FSMContext):
         return
 
     text = message.text.strip()
-    # Accept H:MM or HH:MM
     if not re.match(r"^\d{1,2}:\d{2}$", text):
         await message.answer(
             "❌ <b>Invalid format.</b>\n"
@@ -844,8 +793,6 @@ async def schedule_time_text(message: Message, state: FSMContext):
 
 
 async def _finalize_schedule(message: Message, state: FSMContext, time_str: str, user_id: int = None):
-    # user_id must be passed explicitly when called from a callback query,
-    # because callback.message.from_user is the bot, not the user.
     telegram_id = user_id if user_id is not None else message.from_user.id
 
     data = await state.get_data()
@@ -864,15 +811,15 @@ async def _finalize_schedule(message: Message, state: FSMContext, time_str: str,
         return
 
     date_str = data["selected_date"]
+    bd_datetime_str = f"{date_str} {time_str}:00"
+
     try:
-        # Parse as Bangladesh naive datetime (user selected in BD time)
-        scheduled_at_bd = datetime.strptime(f"{date_str} {time_str}:00", "%Y-%m-%d %H:%M:%S")
+        scheduled_bd = datetime.strptime(bd_datetime_str, BD_TIME_FMT)
     except ValueError:
         await message.answer("❌ Invalid date or time.")
         return
 
-    # "In the past" check uses Bangladesh current time
-    if scheduled_at_bd < now_bd():
+    if scheduled_bd < now_bd():
         await message.answer(
             "❌ <b>Cannot schedule a call in the past.</b>\n"
             f"<i>Current BD time: {now_bd().strftime('%d %b %Y %H:%M')}</i>",
@@ -880,15 +827,12 @@ async def _finalize_schedule(message: Message, state: FSMContext, time_str: str,
         )
         return
 
-    # Store as UTC so MySQL NOW() comparison in the scheduler works correctly
-    scheduled_at_utc = bd_to_utc(scheduled_at_bd)
-
     try:
         call_id = database.save_scheduled_call(
             telegram_id=telegram_id,
             phone_number=data["phone"],
             audio_path=data["audio_path"],
-            scheduled_at=scheduled_at_utc,
+            scheduled_at_bd_str=bd_datetime_str,
         )
     except Exception as e:
         logger.error("save_scheduled_call error: %s", e)
@@ -902,21 +846,18 @@ async def _finalize_schedule(message: Message, state: FSMContext, time_str: str,
         return
 
     await state.clear()
-    # Show the user their selected BD time in the confirmation
-    mn_name = MONTH_NAMES[scheduled_at_bd.month - 1]
+    mn_name = MONTH_NAMES[scheduled_bd.month - 1]
     await message.answer(
         f"✅ <b>Call Scheduled!</b>\n\n"
         f"🆔 ID: <b>{call_id}</b>\n"
         f"📞 Number: <b>{data['phone']}</b>\n"
-        f"📅 Date: <b>{scheduled_at_bd.day:02d} {mn_name} {scheduled_at_bd.year}</b>\n"
-        f"🕐 Time: <b>{scheduled_at_bd.strftime('%H:%M')} (BD)</b>\n\n"
+        f"📅 Date: <b>{scheduled_bd.day:02d} {mn_name} {scheduled_bd.year}</b>\n"
+        f"🕐 Time: <b>{scheduled_bd.strftime('%H:%M')} (BD)</b>\n\n"
         f"⏳ You will be notified when the call is completed.",
         parse_mode="HTML",
         reply_markup=MAIN_MENU,
     )
 
-
-# ─── My Scheduled Calls ───────────────────────────────────────────────────────
 
 @dp.message(F.text == "📋 My Scheduled Calls")
 async def my_calls(message: Message, state: FSMContext):
@@ -958,13 +899,13 @@ async def view_call(callback: CallbackQuery):
         await callback.answer("⚠️ Call not found.", show_alert=True)
         return
 
-    dt = call["scheduled_at"]
-    if hasattr(dt, "strftime"):
-        dt_bd    = utc_to_bd(dt)
-        date_str = dt_bd.strftime("%d.%m.%Y")
-        time_str = dt_bd.strftime("%H:%M") + " (BD)"
-    else:
-        date_str = str(dt)
+    scheduled_str = call.get("scheduled_at", "")
+    try:
+        dt = datetime.strptime(scheduled_str, BD_TIME_FMT)
+        date_str = dt.strftime("%d.%m.%Y")
+        time_str = dt.strftime("%H:%M") + " (BD)"
+    except (ValueError, TypeError):
+        date_str = scheduled_str
         time_str = ""
 
     await callback.message.edit_text(
@@ -1043,8 +984,6 @@ async def confirm_delete_call(callback: CallbackQuery):
         await callback.answer("⚠️ Call not found.", show_alert=True)
     await callback.answer()
 
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
 
 async def main():
     database.init_db()

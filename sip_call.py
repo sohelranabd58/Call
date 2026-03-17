@@ -3,7 +3,15 @@ import logging
 import socket
 import uuid
 import os
+import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+from config import (
+    COUNTRY_CODE_PREFIX,
+    CALL_TIMEOUT_SECONDS,
+    PJSUA_DURATION_SECONDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -12,19 +20,13 @@ _UDP_TIMEOUT = 4
 _DNS_TIMEOUT = 6
 
 
-# ── DNS ────────────────────────────────────────────────────────────────────────
-
 def resolve_domain(domain: str) -> tuple[str | None, str | None]:
-    """
-    Resolve a domain to an IP address with a hard timeout.
-    Returns (ip, None) on success, (None, error_msg) on failure.
-    """
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(socket.gethostbyname, domain)
     try:
         ip = future.result(timeout=_DNS_TIMEOUT)
         executor.shutdown(wait=False)
-        logger.info("DNS: %s → %s", domain, ip)
+        logger.info("DNS: %s -> %s", domain, ip)
         return ip, None
     except FutureTimeout:
         executor.shutdown(wait=False)
@@ -36,25 +38,20 @@ def resolve_domain(domain: str) -> tuple[str | None, str | None]:
         return None, str(e)
 
 
-# ── TCP ────────────────────────────────────────────────────────────────────────
-
 def try_tcp(domain: str, port: int) -> bool:
-    """Returns True if a TCP connection to domain:port succeeded."""
     try:
         sock = socket.create_connection((domain, port), timeout=_TCP_TIMEOUT)
         sock.close()
         logger.info("TCP OK: %s:%d", domain, port)
         return True
     except OSError as e:
-        logger.debug("TCP fail %s:%d — %s", domain, port, e)
+        logger.debug("TCP fail %s:%d - %s", domain, port, e)
         return False
 
 
-# ── UDP SIP ────────────────────────────────────────────────────────────────────
-
 def _build_sip_register(domain, username, port):
-    branch  = "z9hG4bK" + uuid.uuid4().hex[:10]
-    tag     = uuid.uuid4().hex[:8]
+    branch = "z9hG4bK" + uuid.uuid4().hex[:10]
+    tag = uuid.uuid4().hex[:8]
     call_id = uuid.uuid4().hex
     return (
         f"REGISTER sip:{domain} SIP/2.0\r\n"
@@ -70,13 +67,6 @@ def _build_sip_register(domain, username, port):
 
 
 def try_udp(domain: str, username: str, port: int) -> tuple[bool | None, str | None]:
-    """
-    Sends a SIP REGISTER over UDP and waits for a response.
-    Returns:
-      (True, msg)  — server replied positively (401/200/407)
-      (False, msg) — server replied with a credential error (403/404)
-      (None, None) — no response (timeout/unreachable)
-    """
     sock = None
     try:
         msg = _build_sip_register(domain, username, port)
@@ -90,18 +80,18 @@ def try_udp(domain: str, username: str, port: int) -> tuple[bool | None, str | N
         if "SIP/2.0" not in response:
             return None, None
         if "401 " in response or "407 " in response or "200 " in response:
-            return True, "✅ SIP server verified via UDP."
+            return True, "SIP server verified via UDP."
         if "403" in response:
-            return False, "❌ Server rejected credentials (403). Check username/password."
+            return False, "Server rejected credentials (403). Check username/password."
         if "404" in response:
-            return False, "❌ Username not found on this server (404)."
-        return True, "✅ SIP server reachable via UDP."
+            return False, "Username not found on this server (404)."
+        return True, "SIP server reachable via UDP."
 
     except socket.timeout:
         logger.debug("UDP timeout %s:%d", domain, port)
         return None, None
     except OSError as e:
-        logger.debug("UDP error %s:%d — %s", domain, port, e)
+        logger.debug("UDP error %s:%d - %s", domain, port, e)
         return None, None
     finally:
         if sock:
@@ -111,23 +101,15 @@ def try_udp(domain: str, username: str, port: int) -> tuple[bool | None, str | N
                 pass
 
 
-# ── Combined test (used by scheduler for background retries) ───────────────────
-
 def test_sip_connection(domain: str, username: str, password: str):
-    """
-    Quick combined test. Returns (success: bool, message: str).
-    Used internally; the bot handler uses the step functions above for live feedback.
-    """
     ip, err = resolve_domain(domain)
     if not ip:
-        return False, f"❌ Cannot resolve domain '{domain}'. Please check the domain name."
+        return False, f"Cannot resolve domain '{domain}'. Please check the domain name."
 
-    # TCP
     for port in (5060, 5061):
         if try_tcp(domain, port):
-            return True, f"✅ SIP server reachable (TCP:{port})."
+            return True, f"SIP server reachable (TCP:{port})."
 
-    # UDP
     for port in (5060, 5061):
         ok, msg = try_udp(domain, username, port)
         if ok is True:
@@ -135,25 +117,30 @@ def test_sip_connection(domain: str, username: str, password: str):
         if ok is False:
             return False, msg
 
-    # Domain resolves but no SIP response — allow with warning
     return True, (
-        f"⚠️ <b>Domain found</b> ({domain} → {ip}), "
-        "but full SIP test was unavailable in this environment.\n"
-        "Credentials saved — they will be verified when the first call is made."
+        f"Domain found ({domain} -> {ip}), "
+        "but full SIP test was unavailable in this environment. "
+        "Credentials saved - they will be verified when the first call is made."
     )
 
 
-# ── Audio conversion ───────────────────────────────────────────────────────────
-
-def _convert_to_wav(audio_path: str) -> str | None:
-    """
-    Convert any audio file to a pjsua-compatible WAV (PCM, 16-bit, 8000 Hz, mono).
-    Returns the path to the WAV file, or None on failure.
-    The caller is responsible for deleting the returned temp file if it differs
-    from the original.
-    """
+def convert_to_wav(audio_path: str) -> str | None:
     if audio_path.lower().endswith(".wav"):
-        return audio_path
+        probe_cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name,sample_rate,channels",
+            "-of", "csv=p=0",
+            audio_path,
+        ]
+        try:
+            probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+            info = probe.stdout.strip()
+            if "pcm_s16le" in info and "8000" in info and info.endswith(",1"):
+                logger.info("WAV already in correct format: %s", audio_path)
+                return audio_path
+        except Exception:
+            pass
 
     wav_path = os.path.splitext(audio_path)[0] + "_pjsua.wav"
     cmd = [
@@ -167,7 +154,7 @@ def _convert_to_wav(audio_path: str) -> str | None:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode == 0 and os.path.isfile(wav_path):
-            logger.info("Converted %s → %s", audio_path, wav_path)
+            logger.info("Converted %s -> %s", audio_path, wav_path)
             return wav_path
         else:
             logger.error("ffmpeg conversion failed: %s", result.stderr[:500])
@@ -180,142 +167,213 @@ def _convert_to_wav(audio_path: str) -> str | None:
         return None
 
 
-# ── Call placement ─────────────────────────────────────────────────────────────
+def strip_country_code(phone_number: str, prefix: str = None) -> str:
+    if prefix is None:
+        prefix = COUNTRY_CODE_PREFIX
+    num = phone_number.strip()
+    if prefix and num.startswith(prefix):
+        num = num[len(prefix):]
+    elif prefix and prefix.startswith("+") and num.startswith(prefix[1:]):
+        num = num[len(prefix) - 1:]
+    return num
 
-def place_sip_call(sip_domain, sip_username, sip_password, phone_number, audio_path):
-    """
-    Places an outbound SIP call using pjsua.
-    Returns: "answered" | "not_answered" | "failed"
-    """
-    if not os.path.isfile(audio_path):
-        logger.error("Audio file not found: %s", audio_path)
-        return "failed"
 
-    wav_path = _convert_to_wav(audio_path)
-    if wav_path is None:
-        logger.error("Could not convert audio to WAV: %s", audio_path)
-        return "failed"
+def _read_output_with_timeout(proc, timeout):
+    output_lines = []
+    stop_event = threading.Event()
 
-    # Strip +88 (BD country code) so the SIP provider receives local format
-    # e.g. +8801633565853 → 01633565853
-    dial_number = phone_number
-    if dial_number.startswith("+88"):
-        dial_number = dial_number[3:]
-    elif dial_number.startswith("88") and len(dial_number) > 10:
-        dial_number = dial_number[2:]
-
-    sip_uri = f"sip:{dial_number}@{sip_domain}"
-    logger.info("SIP URI: %s (original number: %s)", sip_uri, phone_number)
-
-    def _run_pjsua(call_uri, extra_args):
-        cmd = [
-            "pjsua",
-            "--app-log-level=4",
-            f"--id=sip:{sip_username}@{sip_domain}",
-            "--realm=*",
-            f"--username={sip_username}",
-            f"--password={sip_password}",
-            "--no-vad",
-            "--no-tcp",
-            f"--play-file={wav_path}",
-            "--auto-play",
-            "--auto-play-hangup",
-            "--duration=55",
-        ] + extra_args + [call_uri]
-
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+    def _reader():
         try:
-            stdout, stderr = proc.communicate(timeout=90)
-        except subprocess.TimeoutExpired:
-            try:
-                proc.stdin.write(b"q\n")
-                proc.stdin.flush()
-            except Exception:
-                pass
-            try:
-                stdout, stderr = proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                stdout, stderr = proc.communicate()
-
-        class _Result:
+            while not stop_event.is_set():
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                output_lines.append(line.decode(errors="ignore"))
+        except Exception:
             pass
-        r = _Result()
-        r.stdout = (stdout or b"").decode(errors="ignore")
-        r.stderr = (stderr or b"").decode(errors="ignore")
-        r.returncode = proc.returncode
-        return r
 
-    def _parse_result(output, label):
-        logger.info("pjsua output [%s → %s]:\n%s", label, phone_number, output)
-        if "CONFIRMED" in output:
-            return "answered"
-        if "403 " in output:
-            return "failed"
-        if "Registration failed" in output and "503" in output:
-            return None  # signal: try fallback
-        if any(c in output for c in (
-            "408 ", "480 ", "486 ", "487 ",
-            "Request Timeout", "Temporarily Unavailable",
-            "Busy Here", "Request Terminated",
-        )):
-            return "not_answered"
-        return None  # inconclusive — try fallback
+    reader_thread = threading.Thread(target=_reader, daemon=True)
+    reader_thread.start()
 
-    try:
-        logger.info("Calling %s via %s@%s (with registration)", phone_number, sip_username, sip_domain)
-        r1 = _run_pjsua(sip_uri, [
+    start_time = time.time()
+    call_confirmed = False
+    call_disconnected = False
+
+    while time.time() - start_time < timeout:
+        if not reader_thread.is_alive():
+            break
+
+        full_output = "".join(output_lines)
+        if "CONFIRMED" in full_output:
+            call_confirmed = True
+        if call_confirmed and ("DISCONNECTED" in full_output or "state changed to DISCONNCTD" in full_output):
+            call_disconnected = True
+            break
+        if "403 " in full_output or "404 " in full_output:
+            break
+        if "Registration failed" in full_output and "503" in full_output:
+            break
+        if any(code in full_output for code in ("408 ", "480 ", "486 ", "487 ")):
+            time.sleep(2)
+            break
+
+        time.sleep(0.5)
+
+    stop_event.set()
+    return "".join(output_lines)
+
+
+def _run_pjsua(sip_uri, sip_domain, sip_username, sip_password, wav_path, with_registration=True):
+    cmd = [
+        "pjsua",
+        "--app-log-level=4",
+        f"--id=sip:{sip_username}@{sip_domain}",
+        "--realm=*",
+        f"--username={sip_username}",
+        f"--password={sip_password}",
+        "--no-vad",
+        "--no-tcp",
+        f"--play-file={wav_path}",
+        "--auto-play",
+        "--auto-play-hangup",
+        f"--duration={PJSUA_DURATION_SECONDS}",
+    ]
+
+    if with_registration:
+        cmd.extend([
             f"--registrar=sip:{sip_domain}",
             "--reg-timeout=300",
         ])
-        res = _parse_result(r1.stdout + r1.stderr, "registered")
 
-        if res == "answered":
-            logger.info("Call to %s: ANSWERED", phone_number)
-            return "answered"
-        if res == "failed":
-            logger.error("SIP hard failure for %s", phone_number)
-            return "failed"
+    cmd.append(sip_uri)
 
-        # Registration failed (503) or inconclusive → retry without registration
-        logger.info("Retrying call to %s without registration (IP-auth mode)", phone_number)
-        r2 = _run_pjsua(sip_uri, [])
-        output2 = r2.stdout + r2.stderr
-        logger.info("pjsua output [no-reg → %s]:\n%s", phone_number, output2)
+    logger.info("Running pjsua: %s", " ".join(cmd))
 
-        if "CONFIRMED" in output2:
-            logger.info("Call to %s: ANSWERED (no-reg mode)", phone_number)
-            return "answered"
-        if "403 " in output2:
-            logger.error("SIP auth rejected (403) for %s", phone_number)
-            return "failed"
-        if any(c in output2 for c in (
-            "408 ", "480 ", "486 ", "487 ",
-            "Request Timeout", "Temporarily Unavailable",
-            "Busy Here", "Request Terminated",
-        )):
-            logger.info("Call to %s: NOT ANSWERED", phone_number)
-            return "not_answered"
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
 
-        logger.info("Call to %s: completed (status unclear)", phone_number)
-        return "not_answered"
+    try:
+        output = _read_output_with_timeout(proc, CALL_TIMEOUT_SECONDS)
+    except Exception as e:
+        logger.error("Error reading pjsua output: %s", e)
+        output = ""
+
+    try:
+        proc.stdin.write(b"q\n")
+        proc.stdin.flush()
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=3)
+        except Exception:
+            pass
+
+    return output
+
+
+def _parse_pjsua_output(output: str) -> str:
+    if "CONFIRMED" in output:
+        return "answered"
+    if "403 " in output:
+        return "auth_rejected"
+    if "404 " in output:
+        return "user_not_found"
+    if "Registration failed" in output and "503" in output:
+        return "reg_503"
+    if "486 " in output or "Busy Here" in output:
+        return "busy"
+    if "408 " in output or "Request Timeout" in output:
+        return "timeout"
+    if "480 " in output or "Temporarily Unavailable" in output:
+        return "unavailable"
+    if "487 " in output or "Request Terminated" in output:
+        return "terminated"
+    if "No route" in output or "PJSIP_ETRANSPORT" in output:
+        return "network_error"
+    return "unknown"
+
+
+def place_sip_call(sip_domain, sip_username, sip_password, phone_number, audio_path, country_code_prefix=None):
+    if not os.path.isfile(audio_path):
+        logger.error("Audio file not found: %s", audio_path)
+        return "failed", "Audio file not found"
+
+    if audio_path.lower().endswith(".wav"):
+        wav_path = audio_path
+        wav_is_temp = False
+    else:
+        wav_path = convert_to_wav(audio_path)
+        if wav_path is None:
+            logger.error("Could not convert audio to WAV: %s", audio_path)
+            return "failed", "Audio conversion failed"
+        wav_is_temp = (wav_path != audio_path)
+
+    dial_number = strip_country_code(phone_number, prefix=country_code_prefix)
+    sip_uri = f"sip:{dial_number}@{sip_domain}"
+    logger.info("SIP URI: %s (original: %s)", sip_uri, phone_number)
+
+    try:
+        logger.info("Attempt 1: calling %s with registration", phone_number)
+        output1 = _run_pjsua(sip_uri, sip_domain, sip_username, sip_password, wav_path, with_registration=True)
+        result1 = _parse_pjsua_output(output1)
+        logger.info("pjsua [registered -> %s]: result=%s\nOutput:\n%s", phone_number, result1, output1[-2000:])
+
+        if result1 == "answered":
+            return "answered", "Call answered and audio played"
+        if result1 == "auth_rejected":
+            return "failed", "SIP server rejected credentials (403)"
+        if result1 == "user_not_found":
+            return "failed", "SIP username not found on server (404)"
+        if result1 == "busy":
+            return "not_answered", "Line was busy (486)"
+        if result1 == "timeout":
+            return "not_answered", "Call timed out - no answer (408)"
+        if result1 == "unavailable":
+            return "not_answered", "Number temporarily unavailable (480)"
+        if result1 == "terminated":
+            return "not_answered", "Call was terminated (487)"
+        if result1 == "network_error":
+            return "failed", "Network error - cannot reach SIP server"
+
+        if result1 == "reg_503":
+            logger.info("Registration returned 503. Retrying %s without registration (IP-auth)", phone_number)
+            output2 = _run_pjsua(sip_uri, sip_domain, sip_username, sip_password, wav_path, with_registration=False)
+            result2 = _parse_pjsua_output(output2)
+            logger.info("pjsua [no-reg -> %s]: result=%s\nOutput:\n%s", phone_number, result2, output2[-2000:])
+
+            if result2 == "answered":
+                return "answered", "Call answered (IP-auth mode after 503)"
+            if result2 == "auth_rejected":
+                return "failed", "SIP auth rejected (403) in IP-auth mode"
+            if result2 == "user_not_found":
+                return "failed", "SIP user not found (404) in IP-auth mode"
+            if result2 == "busy":
+                return "not_answered", "Line was busy (486)"
+            if result2 == "timeout":
+                return "not_answered", "No answer (408)"
+            if result2 == "unavailable":
+                return "not_answered", "Number unavailable (480)"
+            if result2 == "terminated":
+                return "not_answered", "Call terminated (487)"
+            if result2 == "network_error":
+                return "failed", "Network error - cannot reach SIP server"
+            return "not_answered", "Call completed but status unclear (IP-auth mode)"
+
+        return "not_answered", "Call completed but status unclear"
 
     except FileNotFoundError:
-        logger.error("pjsua not installed.")
-        return "failed"
-    except subprocess.TimeoutExpired:
-        logger.error("Call to %s timed out.", phone_number)
-        return "not_answered"
+        logger.error("pjsua not installed")
+        return "failed", "pjsua is not installed on this server"
     except Exception as exc:
         logger.exception("Unexpected error placing call: %s", exc)
-        return "failed"
+        return "failed", f"Unexpected error: {exc}"
     finally:
-        if wav_path != audio_path and os.path.isfile(wav_path):
+        if wav_is_temp and wav_path and os.path.isfile(wav_path):
             try:
                 os.remove(wav_path)
             except Exception:
