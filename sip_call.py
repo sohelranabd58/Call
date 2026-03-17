@@ -163,10 +163,8 @@ def place_sip_call(sip_domain, sip_username, sip_password, phone_number, audio_p
         f"--username={sip_username}",
         f"--password={sip_password}",
         "--no-vad",
-        "--auto-answer=200",
         f"--play-file={audio_path}",
         "--auto-play",
-        "--auto-hangup=5",
         "--duration=120",
         sip_uri,
     ]
@@ -175,16 +173,23 @@ def place_sip_call(sip_domain, sip_username, sip_password, phone_number, audio_p
         logger.info("Calling %s via %s@%s", phone_number, sip_username, sip_domain)
         result = subprocess.run(cmd, timeout=180, capture_output=True, text=True)
         output = result.stdout + result.stderr
+        logger.info("pjsua output for call to %s:\n%s", phone_number, output[:2000])
 
         if result.returncode == 0:
-            if "CONFIRMED" in output or "200 OK" in output:
+            answered = (
+                "CONFIRMED" in output
+                or "200 OK" in output
+                or "Early media" in output
+                or "SDP" in output
+            )
+            if answered:
                 logger.info("Call to %s was answered.", phone_number)
                 return "answered"
             else:
                 logger.info("Call to %s was not answered.", phone_number)
                 return "not_answered"
         else:
-            logger.error("pjsua error: %s", result.stderr)
+            logger.error("pjsua failed (code %d): %s", result.returncode, output[:1000])
             return "failed"
 
     except FileNotFoundError:
