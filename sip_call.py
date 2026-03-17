@@ -202,43 +202,54 @@ def place_sip_call(sip_domain, sip_username, sip_password, phone_number, audio_p
         "pjsua",
         f"--id=sip:{sip_username}@{sip_domain}",
         f"--registrar=sip:{sip_domain}",
+        f"--realm=*",
         f"--username={sip_username}",
         f"--password={sip_password}",
+        "--reg-timeout=15",
         "--no-vad",
+        "--null-audio",
         f"--play-file={wav_path}",
         "--auto-play",
-        "--duration=120",
+        "--duration=60",
         sip_uri,
     ]
 
     try:
         logger.info("Calling %s via %s@%s", phone_number, sip_username, sip_domain)
-        result = subprocess.run(cmd, timeout=180, capture_output=True, text=True)
+        result = subprocess.run(cmd, timeout=120, capture_output=True, text=True)
         output = result.stdout + result.stderr
-        logger.info("pjsua output for call to %s:\n%s", phone_number, output[:2000])
+        logger.info("pjsua full output for call to %s:\n%s", phone_number, output)
 
-        if result.returncode == 0:
-            answered = (
-                "CONFIRMED" in output
-                or "200 OK" in output
-                or "Early media" in output
-                or "SDP" in output
+        answered = "CONFIRMED" in output or "state changed to CONFIRMED" in output
+        not_answered_codes = any(
+            code in output for code in (
+                "408 ", "480 ", "486 ", "487 ", "503 ",
+                "Request Timeout", "Temporarily Unavailable",
+                "Busy Here", "Request Terminated",
             )
-            if answered:
-                logger.info("Call to %s was answered.", phone_number)
-                return "answered"
-            else:
-                logger.info("Call to %s was not answered.", phone_number)
-                return "not_answered"
+        )
+        registration_failed = any(
+            code in output for code in ("401 ", "403 ", "407 ", "Registration failed")
+        )
+
+        if answered:
+            logger.info("Call to %s: ANSWERED", phone_number)
+            return "answered"
+        elif registration_failed:
+            logger.error("SIP registration/auth failed for call to %s", phone_number)
+            return "failed"
+        elif not_answered_codes or result.returncode == 0:
+            logger.info("Call to %s: NOT ANSWERED (code %d)", phone_number, result.returncode)
+            return "not_answered"
         else:
-            logger.error("pjsua failed (code %d): %s", result.returncode, output[:1000])
+            logger.error("pjsua error (code %d)", result.returncode)
             return "failed"
 
     except FileNotFoundError:
         logger.error("pjsua not installed. Run: apt-get install pjsua")
         return "failed"
     except subprocess.TimeoutExpired:
-        logger.error("Call to %s timed out.", phone_number)
+        logger.error("Call to %s timed out after 120s.", phone_number)
         return "not_answered"
     except Exception as exc:
         logger.exception("Unexpected error placing call: %s", exc)
